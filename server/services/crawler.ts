@@ -27,7 +27,7 @@ const TEXT_TYPE_PATTERN =
 const PAGE_EXTENSION_PATTERN = /\.(html?|php|asp|aspx|jsp)$/i;
 const ASSET_EXTENSION_PATTERN = /\.(css|js|json|map|txt)$/i;
 
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 20_000);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 12_000);
 const CRAWL_TIMEOUT_MS = Number(process.env.CRAWL_TIMEOUT_MS || 300_000);
 const MAX_TEXT_BYTES = 1024 * 1024;
 const ALLOW_INSECURE_TLS = process.env.ALLOW_INSECURE_TLS !== 'false';
@@ -35,6 +35,7 @@ const ALLOW_INSECURE_TLS = process.env.ALLOW_INSECURE_TLS !== 'false';
 export async function crawlTarget(
   targetUrl: string,
   options: CrawlOptions,
+  onProgress?: (snapshot: CrawlResult) => void,
 ): Promise<CrawlResult> {
   const startedAt = Date.now();
   const origin = new URL(targetUrl).origin;
@@ -49,10 +50,21 @@ export async function crawlTarget(
   const forms: DiscoveredForm[] = [];
   const queryParams: Array<{ endpoint: string; paramName: string }> = [];
   const errors: string[] = [];
+  const reportProgress = () => {
+    onProgress?.({
+      files,
+      requests,
+      pageUrls,
+      forms,
+      queryParams,
+      errors,
+    });
+  };
 
   while (queue.length > 0) {
     if (Date.now() - startedAt > CRAWL_TIMEOUT_MS) {
       errors.push(`Crawl timed out after ${CRAWL_TIMEOUT_MS}ms`);
+      reportProgress();
       break;
     }
 
@@ -72,11 +84,14 @@ export async function crawlTarget(
     pageVisited.add(current.url);
     pageUrls.push(current.url);
     addQueryParamsFromUrl(current.url, queryParams);
+    reportProgress();
 
     const pageResult = await fetchTextResource(current.url);
     requests.push(pageResult.record);
+    reportProgress();
     if (pageResult.record.error) {
       errors.push(`Failed to fetch ${current.url}: ${pageResult.record.error}`);
+      reportProgress();
       continue;
     }
 
@@ -89,6 +104,7 @@ export async function crawlTarget(
       fileSeen,
       buildFile(current.url, pageResult.text, current.discoveredFrom, pageResult.contentType),
     );
+    reportProgress();
 
     const discoveredForms = extractForms(pageResult.text, current.url);
     for (const form of discoveredForms) {
@@ -96,6 +112,7 @@ export async function crawlTarget(
         forms.push(form);
       }
     }
+    reportProgress();
 
     const links = extractUrls(pageResult.text, current.url, ['a'], 'href');
     for (const link of links) {
@@ -132,9 +149,11 @@ export async function crawlTarget(
 
       assetVisited.add(normalizedAsset);
       addQueryParamsFromUrl(normalizedAsset, queryParams);
+      reportProgress();
 
       const assetResult = await fetchTextResource(normalizedAsset);
       requests.push(assetResult.record);
+      reportProgress();
       if (assetResult.record.error || !assetResult.text) {
         continue;
       }
@@ -143,6 +162,7 @@ export async function crawlTarget(
         fileSeen,
         buildFile(normalizedAsset, assetResult.text, current.url, assetResult.contentType),
       );
+      reportProgress();
     }
   }
 

@@ -1,13 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
-  ChevronDown,
   FileCode2,
   FileJson,
   FileType2,
+  FolderOpen,
   Globe,
   KeyRound,
-  Maximize2,
   Moon,
   Play,
   RefreshCw,
@@ -41,10 +40,27 @@ import {
 
 type Tab = 'files' | 'findings' | 'secrets' | 'network' | 'surface' | 'diffs';
 
+interface FolderNode {
+  key: string;
+  label: string;
+  depth: number;
+  parentKey: string | null;
+  childKeys: string[];
+  files: FileEntry[];
+  findings: Finding[];
+}
+
+interface FolderModel {
+  nodes: Record<string, FolderNode>;
+  orderedKeys: string[];
+  fileToFolder: Record<string, string>;
+}
+
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [url, setUrl] = useState('https://example.com/');
   const [previewUrl, setPreviewUrl] = useState('https://example.com/');
+  const [previewCurrentUrl, setPreviewCurrentUrl] = useState<string | null>(null);
   const [previewSession, setPreviewSession] = useState<PreviewSession | null>(null);
 
   const [activeTab, setActiveTab] = useState<Tab>('files');
@@ -52,14 +68,16 @@ export default function App() {
   const [scanSummary, setScanSummary] = useState<ScanSummary | null>(null);
 
   const [files, setFiles] = useState<FileEntry[]>([]);
-  const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
-  const [selectedFileContent, setSelectedFileContent] = useState<string>('');
-  const [selectedFileName, setSelectedFileName] = useState<string>('Select a file');
-
   const [findings, setFindings] = useState<Finding[]>([]);
   const [network, setNetwork] = useState<NetworkEntry[]>([]);
   const [surface, setSurface] = useState<SurfaceItem[]>([]);
   const [diffs, setDiffs] = useState<ActiveDiff[]>([]);
+
+  const [selectedFolderKey, setSelectedFolderKey] = useState<string | null>(null);
+  const [followPreviewFolder, setFollowPreviewFolder] = useState(true);
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
+  const [selectedFileName, setSelectedFileName] = useState('Select a file');
+  const [selectedFileContent, setSelectedFileContent] = useState('');
 
   const [isScanning, setIsScanning] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -68,6 +86,7 @@ export default function App() {
   const eventsRef = useRef<EventSource | null>(null);
   const pollingRef = useRef<number | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
+  const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
 
   useEffect(() => {
     if (theme === 'dark') {
@@ -87,74 +106,149 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!scanId || !selectedFileId) {
-      return;
-    }
-    void loadFileContent(scanId, selectedFileId);
-  }, [scanId, selectedFileId]);
+  const folderModel = useMemo(
+    () => buildFolderModel(files, findings, scanSummary?.targetUrl || previewCurrentUrl || previewUrl),
+    [files, findings, scanSummary?.targetUrl, previewCurrentUrl, previewUrl],
+  );
+  const folders = useMemo(() => folderModel.orderedKeys.map((key) => folderModel.nodes[key]), [folderModel]);
+
+  const selectedFolderFiles = useMemo(() => {
+    if (!selectedFolderKey) return files;
+    return folderModel.nodes[selectedFolderKey]?.files || [];
+  }, [files, folderModel, selectedFolderKey]);
+
+  const selectedFolderFindings = useMemo(() => {
+    if (!selectedFolderKey) return findings;
+    return folderModel.nodes[selectedFolderKey]?.findings || [];
+  }, [findings, folderModel, selectedFolderKey]);
 
   const vulnFindings = useMemo(
-    () => findings.filter((finding) => finding.type === 'vuln' || finding.type === 'anomaly'),
-    [findings],
+    () => selectedFolderFindings.filter((f) => f.type === 'vuln' || f.type === 'anomaly'),
+    [selectedFolderFindings],
   );
   const secretFindings = useMemo(
-    () => findings.filter((finding) => finding.type === 'secret'),
-    [findings],
+    () => selectedFolderFindings.filter((f) => f.type === 'secret'),
+    [selectedFolderFindings],
   );
+
+  const selectedFolderLabel = useMemo(() => {
+    if (!selectedFolderKey) return 'All Pages';
+    return folderModel.nodes[selectedFolderKey]?.label || selectedFolderKey;
+  }, [selectedFolderKey, folderModel]);
+
   const latestScanError = useMemo(() => {
-    if (!scanSummary?.errors || scanSummary.errors.length === 0) {
-      return null;
-    }
+    if (!scanSummary?.errors?.length) return null;
     return scanSummary.errors[scanSummary.errors.length - 1];
   }, [scanSummary]);
 
-  async function handleScan(event: React.FormEvent) {
-    event.preventDefault();
+  const previewFrameSrc = useMemo(
+    () => `/api/preview/proxy?target=${encodeURIComponent(previewUrl)}`,
+    [previewUrl],
+  );
+
+  useEffect(() => {
+    if (selectedFolderFiles.length === 0) {
+      setSelectedFileId(null);
+      setSelectedFileName('Select a file');
+      setSelectedFileContent('');
+      return;
+    }
+    if (!selectedFileId || !selectedFolderFiles.some((f) => f.fileId === selectedFileId)) {
+      setSelectedFileId(selectedFolderFiles[0].fileId);
+    }
+  }, [selectedFileId, selectedFolderFiles]);
+
+  useEffect(() => {
+    if (!scanId || !selectedFileId) return;
+    void loadFileContent(scanId, selectedFileId);
+  }, [scanId, selectedFileId]);
+
+  useEffect(() => {
+    if (!followPreviewFolder || folders.length === 0) return;
+    const preferred = resolveFolderForUrl(
+      previewCurrentUrl || scanSummary?.targetUrl || previewUrl,
+      folderModel.nodes,
+    ) || folders[0].key;
+    if (preferred !== selectedFolderKey) {
+      setSelectedFolderKey(preferred);
+    }
+  }, [followPreviewFolder, folders, folderModel.nodes, previewCurrentUrl, scanSummary?.targetUrl, previewUrl, selectedFolderKey]);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const previewWindow = previewFrameRef.current?.contentWindow;
+      if (previewWindow && event.source !== previewWindow) return;
+
+      const payload = event.data as { type?: string; url?: string } | null;
+      if (!payload || payload.type !== 'hunter-preview-url' || !payload.url) return;
+
+      const nextPreviewUrl = sanitizePreviewMessageUrl(payload.url, scanSummary?.targetUrl || previewUrl);
+      if (!nextPreviewUrl) return;
+
+      // Ignore loopback into the UI host unless the active scan target is also on this host.
+      if (
+        isSameOriginUrl(nextPreviewUrl, window.location.origin) &&
+        !isSameOriginUrl(scanSummary?.targetUrl || previewUrl, window.location.origin)
+      ) {
+        return;
+      }
+
+      setPreviewCurrentUrl(nextPreviewUrl);
+    };
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [previewUrl, scanSummary?.targetUrl]);
+
+  async function runScan(target: string) {
     setErrorMessage(null);
     setIsScanning(true);
     stopPolling();
     clearRefreshTimer();
+    setFollowPreviewFolder(true);
+
     if (eventsRef.current) {
       eventsRef.current.close();
     }
+
     setScanSummary(null);
     setFiles([]);
     setFindings([]);
     setNetwork([]);
     setSurface([]);
     setDiffs([]);
-    setSelectedFileId(null);
-    setSelectedFileContent('');
+    setSelectedFolderKey(null);
+    setPreviewUrl(target);
+    setPreviewCurrentUrl(target);
 
     try {
-      const scanResponse = await startScan(url);
+      const scan = await startScan(target);
+      setScanId(scan.scanId);
+      setPreviewUrl(scan.targetUrl);
+      setPreviewCurrentUrl(scan.targetUrl);
 
-      let nextPreview: PreviewSession | null = null;
       try {
-        nextPreview = await createPreviewSession(url);
+        setPreviewSession(await createPreviewSession(scan.targetUrl));
       } catch {
-        nextPreview = null;
+        setPreviewSession(null);
       }
 
-      setScanId(scanResponse.scanId);
-      setPreviewUrl(scanResponse.targetUrl);
-      setPreviewSession(nextPreview);
-      connectScanEvents(scanResponse.scanId);
-
-      const summary = await getScanSummary(scanResponse.scanId);
-      setScanSummary(summary);
+      connectScanEvents(scan.scanId);
+      setScanSummary(await getScanSummary(scan.scanId));
+      scheduleRefresh(scan.scanId);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to start scan.';
-      setErrorMessage(message);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to start scan.');
       setIsScanning(false);
     }
   }
 
+  async function handleScan(event: React.FormEvent) {
+    event.preventDefault();
+    void runScan(url);
+  }
+
   function connectScanEvents(nextScanId: string) {
-    if (eventsRef.current) {
-      eventsRef.current.close();
-    }
+    if (eventsRef.current) eventsRef.current.close();
     startPolling(nextScanId);
     const source = new EventSource(`/api/scans/${nextScanId}/events`);
     eventsRef.current = source;
@@ -164,13 +258,14 @@ export default function App() {
         const payload = JSON.parse(raw.data) as ScanSummary;
         setScanSummary(payload);
         scheduleRefresh(nextScanId);
+
         if (payload.status === 'completed' || payload.status === 'failed') {
           setIsScanning(false);
           stopPolling();
           void refreshScanDetails(nextScanId);
         }
       } catch {
-        // ignore malformed events
+        // ignore
       }
     };
 
@@ -178,10 +273,7 @@ export default function App() {
     source.addEventListener('scan-updated', onEvent);
     source.addEventListener('scan-completed', onEvent);
     source.addEventListener('scan-failed', onEvent);
-
-    source.onerror = () => {
-      source.close();
-    };
+    source.onerror = () => source.close();
   }
 
   function clearRefreshTimer() {
@@ -192,13 +284,11 @@ export default function App() {
   }
 
   function scheduleRefresh(activeScanId: string) {
-    if (refreshTimerRef.current !== null) {
-      return;
-    }
+    if (refreshTimerRef.current !== null) return;
     refreshTimerRef.current = window.setTimeout(() => {
       refreshTimerRef.current = null;
       void refreshScanDetails(activeScanId);
-    }, 500);
+    }, 600);
   }
 
   function stopPolling() {
@@ -219,9 +309,7 @@ export default function App() {
           if (summary.status === 'completed' || summary.status === 'failed') {
             setIsScanning(false);
             stopPolling();
-            if (eventsRef.current) {
-              eventsRef.current.close();
-            }
+            if (eventsRef.current) eventsRef.current.close();
           }
         } catch {
           // keep polling
@@ -232,9 +320,7 @@ export default function App() {
 
   async function refreshScanDetails(currentScanId?: string) {
     const activeScanId = currentScanId || scanId;
-    if (!activeScanId) {
-      return;
-    }
+    if (!activeScanId) return;
 
     setIsRefreshing(true);
     try {
@@ -256,13 +342,8 @@ export default function App() {
       if (summary.status === 'completed' || summary.status === 'failed') {
         setIsScanning(false);
       }
-
-      if (!selectedFileId && filesData.length > 0) {
-        setSelectedFileId(filesData[0].fileId);
-      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to refresh scan details.';
-      setErrorMessage(message);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to refresh scan details.');
     } finally {
       setIsRefreshing(false);
     }
@@ -280,17 +361,12 @@ export default function App() {
   }
 
   async function changeReviewStatus(findingId: string, status: ReviewStatus) {
-    if (!scanId) {
-      return;
-    }
+    if (!scanId) return;
     try {
       const updated = await updateFindingReviewStatus(scanId, findingId, status);
-      setFindings((previous) =>
-        previous.map((finding) => (finding.id === findingId ? { ...finding, reviewStatus: updated.reviewStatus } : finding)),
-      );
+      setFindings((prev) => prev.map((f) => (f.id === findingId ? { ...f, reviewStatus: updated.reviewStatus } : f)));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to update review status.';
-      setErrorMessage(message);
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to update review status.');
     }
   }
 
@@ -305,36 +381,18 @@ export default function App() {
         </div>
 
         <form onSubmit={handleScan} className="flex-1 max-w-2xl mx-2 sm:mx-4 md:mx-8 flex items-center">
-          <div className={`flex-1 flex items-center h-9 rounded-l-md px-2 sm:px-3 border-y border-l ${theme === 'dark' ? 'bg-[#1a1a1a] border-[#333] focus-within:border-red-500/50' : 'bg-gray-100 border-gray-300 focus-within:border-red-500/50'}`}>
+          <div className={`flex-1 flex items-center h-9 rounded-l-md px-2 sm:px-3 border-y border-l ${theme === 'dark' ? 'bg-[#1a1a1a] border-[#333]' : 'bg-gray-100 border-gray-300'}`}>
             <Globe size={16} className={`hidden sm:block shrink-0 ${theme === 'dark' ? 'text-gray-500' : 'text-gray-400'}`} />
-            <input
-              type="url"
-              value={url}
-              onChange={(event) => setUrl(event.target.value)}
-              placeholder="https://example.com/"
-              className="flex-1 bg-transparent border-none outline-none px-2 sm:px-3 text-sm min-w-0"
-              required
-            />
+            <input type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/" className="flex-1 bg-transparent border-none outline-none px-2 sm:px-3 text-sm min-w-0" required />
           </div>
-          <button
-            type="submit"
-            disabled={isScanning}
-            className={`h-9 px-3 sm:px-4 rounded-r-md flex items-center gap-1 sm:gap-2 text-sm font-medium transition-colors shrink-0 ${
-              isScanning ? 'bg-red-500/50 cursor-not-allowed text-white' : 'bg-red-500 hover:bg-red-600 text-white'
-            }`}
-          >
+          <button type="submit" disabled={isScanning} className={`h-9 px-3 sm:px-4 rounded-r-md flex items-center gap-1 sm:gap-2 text-sm font-medium transition-colors shrink-0 ${isScanning ? 'bg-red-500/50 cursor-not-allowed text-white' : 'bg-red-500 hover:bg-red-600 text-white'}`}>
             {isScanning ? <RefreshCw size={16} className="animate-spin" /> : <Play size={16} />}
             <span className="hidden sm:inline">{isScanning ? 'Scanning...' : 'Scan'}</span>
           </button>
         </form>
 
         <div className="flex items-center gap-2 shrink-0">
-          <button
-            onClick={() => void refreshScanDetails()}
-            className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/5 transition-colors disabled:opacity-60"
-            disabled={!scanId || isRefreshing}
-            title="Refresh scan details"
-          >
+          <button onClick={() => void refreshScanDetails()} className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/5 transition-colors disabled:opacity-60" disabled={!scanId || isRefreshing}>
             <RefreshCw size={18} className={isRefreshing ? 'animate-spin' : ''} />
           </button>
           <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/5 transition-colors">
@@ -350,12 +408,7 @@ export default function App() {
               <Globe size={14} className="shrink-0" />
               <span className="truncate">Live Preview</span>
             </div>
-            <div className="flex items-center gap-2 text-[10px] text-gray-500 uppercase">
-              <span>{previewSession ? previewSession.mode : 'idle'}</span>
-              <button className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-gray-500">
-                <Maximize2 size={14} />
-              </button>
-            </div>
+            <div className="text-[10px] uppercase text-gray-500">{previewSession?.mode || 'proxy'}</div>
           </div>
           <div className="flex-1 flex flex-col bg-white min-h-0 overflow-hidden">
             <div className="h-8 bg-gray-100 border-b border-gray-200 flex items-center px-2 gap-2 shrink-0">
@@ -364,25 +417,17 @@ export default function App() {
                 <div className="w-2.5 h-2.5 rounded-full bg-amber-400"></div>
                 <div className="w-2.5 h-2.5 rounded-full bg-green-400"></div>
               </div>
-              <div className="flex-1 bg-white rounded text-xs px-2 py-1 text-gray-600 truncate border border-gray-200">{previewUrl}</div>
+              <div className="flex-1 bg-white rounded text-xs px-2 py-1 text-gray-600 truncate border border-gray-200">{previewCurrentUrl || previewUrl}</div>
             </div>
             <div className="flex-1 min-h-0 overflow-hidden">
-              <iframe
-                src={previewUrl}
-                className="w-full h-full border-none"
-                title="Live Preview"
-                sandbox="allow-same-origin allow-scripts allow-forms"
-              />
+              <iframe ref={previewFrameRef} src={previewFrameSrc} className="w-full h-full border-none" title="Live Preview" sandbox="allow-same-origin allow-scripts allow-forms" />
             </div>
-            {previewSession?.note ? (
-              <div className="px-3 py-2 text-xs border-t border-gray-200 text-gray-500 bg-gray-50">{previewSession.note}</div>
-            ) : null}
           </div>
         </div>
 
-        <div className="flex-1 flex flex-col bg-transparent min-h-0 min-w-0">
+        <div className="flex-1 flex flex-col min-h-0 min-w-0">
           <div className={`h-10 border-b flex px-2 shrink-0 overflow-x-auto no-scrollbar ${theme === 'dark' ? 'border-[#222] bg-[#121212]' : 'border-gray-200 bg-gray-50'}`}>
-            <TabButton active={activeTab === 'files'} onClick={() => setActiveTab('files')} icon={<FileCode2 size={14} />} label="Files" badge={String(files.length)} />
+            <TabButton active={activeTab === 'files'} onClick={() => setActiveTab('files')} icon={<FileCode2 size={14} />} label="Files" badge={String(selectedFolderFiles.length)} />
             <TabButton active={activeTab === 'findings'} onClick={() => setActiveTab('findings')} icon={<ShieldAlert size={14} />} label="Findings" badge={String(vulnFindings.length)} badgeColor="bg-red-500" />
             <TabButton active={activeTab === 'secrets'} onClick={() => setActiveTab('secrets')} icon={<KeyRound size={14} />} label="Secrets" badge={String(secretFindings.length)} badgeColor="bg-amber-500" />
             <TabButton active={activeTab === 'network'} onClick={() => setActiveTab('network')} icon={<Activity size={14} />} label="Network" badge={String(network.length)} />
@@ -390,31 +435,28 @@ export default function App() {
             <TabButton active={activeTab === 'diffs'} onClick={() => setActiveTab('diffs')} icon={<RefreshCw size={14} />} label="Diffs" badge={String(diffs.length)} />
           </div>
 
-          <div className="flex-1 overflow-hidden min-h-0">
+          <div className="flex-1 min-h-0 overflow-hidden">
             {activeTab === 'files' && (
               <FilesTab
                 theme={theme}
-                files={files}
+                folders={folders}
+                selectedFolderKey={selectedFolderKey}
+                selectedFolderLabel={selectedFolderLabel}
+                followPreviewFolder={followPreviewFolder}
+                onFollowPreview={() => setFollowPreviewFolder(true)}
+                onSelectFolder={(key) => {
+                  setSelectedFolderKey(key);
+                  setFollowPreviewFolder(false);
+                }}
+                files={selectedFolderFiles}
                 selectedFileId={selectedFileId}
                 selectedFileName={selectedFileName}
                 selectedFileContent={selectedFileContent}
                 onSelectFile={setSelectedFileId}
               />
             )}
-            {activeTab === 'findings' && (
-              <FindingsTab
-                theme={theme}
-                findings={vulnFindings}
-                onReviewChange={changeReviewStatus}
-              />
-            )}
-            {activeTab === 'secrets' && (
-              <FindingsTab
-                theme={theme}
-                findings={secretFindings}
-                onReviewChange={changeReviewStatus}
-              />
-            )}
+            {activeTab === 'findings' && <FindingsTab theme={theme} findings={vulnFindings} onReviewChange={changeReviewStatus} />}
+            {activeTab === 'secrets' && <FindingsTab theme={theme} findings={secretFindings} onReviewChange={changeReviewStatus} />}
             {activeTab === 'network' && <NetworkTab theme={theme} requests={network} />}
             {activeTab === 'surface' && <SurfaceTab theme={theme} items={surface} />}
             {activeTab === 'diffs' && <DiffsTab theme={theme} diffs={diffs} />}
@@ -458,7 +500,9 @@ function TabButton({
     <button
       onClick={onClick}
       className={`h-full px-3 sm:px-4 flex items-center gap-1.5 sm:gap-2 text-xs sm:text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
-        active ? 'border-red-500 text-red-500 dark:text-red-400' : 'border-transparent text-gray-500 hover:text-gray-800 dark:hover:text-gray-300'
+        active
+          ? 'border-red-500 text-red-500 dark:text-red-400'
+          : 'border-transparent text-gray-500 hover:text-gray-800 dark:hover:text-gray-300'
       }`}
     >
       <span className="shrink-0">{icon}</span>
@@ -470,6 +514,12 @@ function TabButton({
 
 function FilesTab({
   theme,
+  folders,
+  selectedFolderKey,
+  selectedFolderLabel,
+  followPreviewFolder,
+  onFollowPreview,
+  onSelectFolder,
   files,
   selectedFileId,
   selectedFileName,
@@ -477,6 +527,12 @@ function FilesTab({
   onSelectFile,
 }: {
   theme: 'dark' | 'light';
+  folders: FolderNode[];
+  selectedFolderKey: string | null;
+  selectedFolderLabel: string;
+  followPreviewFolder: boolean;
+  onFollowPreview: () => void;
+  onSelectFolder: (key: string | null) => void;
   files: FileEntry[];
   selectedFileId: string | null;
   selectedFileName: string;
@@ -485,38 +541,87 @@ function FilesTab({
 }) {
   return (
     <div className="flex w-full h-full min-h-0">
-      <div className={`w-1/3 sm:w-64 border-r flex flex-col shrink-0 min-h-0 ${theme === 'dark' ? 'border-[#222] bg-[#0a0a0a]' : 'border-gray-200 bg-gray-50/50'}`}>
-        <div className="p-2 text-[10px] sm:text-xs font-semibold text-gray-500 uppercase tracking-wider truncate">Files</div>
-        <div className="flex-1 overflow-y-auto py-1 min-h-0">
-          <div className="px-2 py-1 flex items-center gap-1 text-xs sm:text-sm text-gray-600 dark:text-gray-400 truncate">
-            <ChevronDown size={14} className="shrink-0" />
-            <Globe size={14} className="shrink-0" />
-            <span className="truncate">same-origin crawl</span>
-          </div>
-          <div className="pl-2 sm:pl-4 pr-1 sm:pr-2">
-            {files.length === 0 ? (
-              <div className="text-xs text-gray-500 px-2 py-2">No files yet.</div>
-            ) : (
-              files.map((file) => (
-                <button
-                  key={file.fileId}
-                  onClick={() => onSelectFile(file.fileId)}
-                  className={`w-full text-left px-2 py-1.5 rounded flex items-center gap-2 text-xs sm:text-sm transition-colors truncate ${
-                    selectedFileId === file.fileId ? (theme === 'dark' ? 'bg-[#222] text-white' : 'bg-gray-200 text-gray-900') : 'text-gray-600 dark:text-gray-400 hover:bg-black/5 dark:hover:bg-white/5'
-                  }`}
-                  title={file.url}
-                >
-                  <span className="shrink-0">{iconForFileKind(file.kind)}</span>
-                  <span className="truncate">{fileNameFromUrl(file.url)}</span>
-                </button>
-              ))
-            )}
-          </div>
+      <div className={`w-1/3 sm:w-80 border-r flex flex-col shrink-0 min-h-0 ${theme === 'dark' ? 'border-[#222] bg-[#0a0a0a]' : 'border-gray-200 bg-gray-50/50'}`}>
+        <div className={`px-2 py-2 border-b ${theme === 'dark' ? 'border-[#222]' : 'border-gray-200'}`}>
+          <div className="text-[10px] sm:text-xs font-semibold text-gray-500 uppercase tracking-wider">Pages</div>
+          <button
+            onClick={onFollowPreview}
+            className={`mt-2 w-full text-left px-2 py-1.5 rounded text-xs transition-colors ${
+              followPreviewFolder
+                ? 'bg-red-500/15 text-red-500 dark:text-red-400'
+                : 'text-gray-600 dark:text-gray-400 hover:bg-black/5 dark:hover:bg-white/5'
+            }`}
+          >
+            Follow preview
+          </button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto py-1">
+          <button
+            onClick={() => onSelectFolder(null)}
+            className={`w-full text-left px-2 py-1.5 rounded flex items-center gap-2 text-xs sm:text-sm transition-colors ${
+              selectedFolderKey === null
+                ? theme === 'dark'
+                  ? 'bg-[#222] text-white'
+                  : 'bg-gray-200 text-gray-900'
+                : 'text-gray-600 dark:text-gray-400 hover:bg-black/5 dark:hover:bg-white/5'
+            }`}
+          >
+            <FolderOpen size={14} className="shrink-0" />
+            <span className="truncate">All Pages</span>
+          </button>
+          {folders.map((folder) => (
+            <button
+              key={folder.key}
+              onClick={() => onSelectFolder(folder.key)}
+              className={`w-full text-left px-2 py-1.5 rounded flex items-center gap-2 text-xs sm:text-sm transition-colors ${
+                selectedFolderKey === folder.key
+                  ? theme === 'dark'
+                    ? 'bg-[#222] text-white'
+                    : 'bg-gray-200 text-gray-900'
+                  : 'text-gray-600 dark:text-gray-400 hover:bg-black/5 dark:hover:bg-white/5'
+              }`}
+              style={{ paddingLeft: `${0.5 + folder.depth * 0.75}rem` }}
+              title={folder.key}
+            >
+              <FolderOpen size={14} className="shrink-0" />
+              <span className="truncate">{folder.label}</span>
+              <span className="ml-auto text-[10px] opacity-70">{folder.files.length}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className={`px-2 py-1.5 border-y text-[10px] sm:text-xs font-semibold text-gray-500 uppercase tracking-wider ${theme === 'dark' ? 'border-[#222]' : 'border-gray-200'}`}>
+          Files ({files.length})
+        </div>
+        <div className="max-h-48 overflow-y-auto py-1">
+          {files.length === 0 ? (
+            <div className="text-xs text-gray-500 px-2 py-2">No files yet.</div>
+          ) : (
+            files.map((file) => (
+              <button
+                key={file.fileId}
+                onClick={() => onSelectFile(file.fileId)}
+                className={`w-full text-left px-2 py-1.5 rounded flex items-center gap-2 text-xs sm:text-sm transition-colors ${
+                  selectedFileId === file.fileId
+                    ? theme === 'dark'
+                      ? 'bg-[#222] text-white'
+                      : 'bg-gray-200 text-gray-900'
+                    : 'text-gray-600 dark:text-gray-400 hover:bg-black/5 dark:hover:bg-white/5'
+                }`}
+                title={file.url}
+              >
+                <span className="shrink-0">{iconForFileKind(file.kind)}</span>
+                <span className="truncate">{fileNameFromUrl(file.url)}</span>
+              </button>
+            ))
+          )}
         </div>
       </div>
       <div className={`flex-1 flex flex-col min-w-0 min-h-0 ${theme === 'dark' ? 'bg-[#121212]' : 'bg-white'}`}>
         <div className={`h-8 border-b flex items-center px-2 sm:px-3 text-xs sm:text-sm truncate ${theme === 'dark' ? 'border-[#222] text-gray-400' : 'border-gray-200 text-gray-600'}`}>
           <span className="truncate">{selectedFileName}</span>
+          <span className="ml-auto text-[10px] uppercase tracking-wider opacity-75">{selectedFolderLabel}</span>
         </div>
         <div className="flex-1 overflow-auto p-2 sm:p-4 min-h-0">
           {selectedFileContent ? (
@@ -692,7 +797,7 @@ function fileNameFromUrl(value: string): string {
     const parsed = new URL(value);
     const part = parsed.pathname.split('/').filter(Boolean).pop();
     if (part) {
-      return part;
+      return safeDecodeSegment(part);
     }
     return `${parsed.hostname}/`;
   } catch {
@@ -718,4 +823,193 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function normalizeComparableUrl(value: string, baseUrl?: string): string | null {
+  if (!value) return null;
+  try {
+    const parsed = baseUrl ? new URL(value, baseUrl) : new URL(value);
+    const normalizedPath = parsed.pathname.replace(/\/+$/, '') || '/';
+    return `${parsed.origin.toLowerCase()}${normalizedPath}${parsed.search}`;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizePreviewMessageUrl(value: string, baseUrl: string): string | null {
+  try {
+    const parsed = new URL(value, baseUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function isSameOriginUrl(value: string, origin: string): boolean {
+  try {
+    return new URL(value).origin.toLowerCase() === origin.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function resolveFolderForUrl(
+  value: string,
+  nodes: Record<string, FolderNode>,
+  baseUrl?: string,
+): string | null {
+  const chain = folderChainForUrl(value, baseUrl);
+  for (let i = chain.length - 1; i >= 0; i -= 1) {
+    if (nodes[chain[i].key]) {
+      return chain[i].key;
+    }
+  }
+
+  const normalized = normalizeComparableUrl(value, baseUrl);
+  if (!normalized) return null;
+
+  let best: string | null = null;
+  for (const key of Object.keys(nodes)) {
+    const comparableKey = key.endsWith('/') ? key.slice(0, -1) : key;
+    if (normalized.startsWith(comparableKey) && (!best || comparableKey.length > best.length)) {
+      best = key;
+    }
+  }
+  return best;
+}
+
+function buildFolderModel(
+  files: FileEntry[],
+  findings: Finding[],
+  targetUrl: string,
+): FolderModel {
+  const nodes: Record<string, FolderNode> = {};
+  const orderedKeys: string[] = [];
+  const fileToFolder: Record<string, string> = {};
+
+  const ensureNode = (entry: FolderDescriptor) => {
+    if (!nodes[entry.key]) {
+      nodes[entry.key] = {
+        key: entry.key,
+        label: entry.label,
+        depth: entry.depth,
+        parentKey: entry.parentKey,
+        childKeys: [],
+        files: [],
+        findings: [],
+      };
+      orderedKeys.push(entry.key);
+    }
+
+    if (entry.parentKey && nodes[entry.parentKey] && !nodes[entry.parentKey].childKeys.includes(entry.key)) {
+      nodes[entry.parentKey].childKeys.push(entry.key);
+    }
+  };
+
+  const addFileToNodeChain = (leafKey: string, file: FileEntry) => {
+    let cursor: string | null = leafKey;
+    while (cursor) {
+      const node = nodes[cursor];
+      if (!node) break;
+      node.files.push(file);
+      cursor = node.parentKey;
+    }
+  };
+
+  const addFindingToNodeChain = (leafKey: string, finding: Finding) => {
+    let cursor: string | null = leafKey;
+    while (cursor) {
+      const node = nodes[cursor];
+      if (!node) break;
+      node.findings.push(finding);
+      cursor = node.parentKey;
+    }
+  };
+
+  for (const file of files) {
+    const chain = folderChainForUrl(file.url, targetUrl);
+    if (chain.length === 0) continue;
+    chain.forEach(ensureNode);
+    const leafKey = chain[chain.length - 1].key;
+    fileToFolder[file.fileId] = leafKey;
+    addFileToNodeChain(leafKey, file);
+  }
+
+  for (const finding of findings) {
+    let folderKey: string | null = null;
+    if (finding.location.fileId && fileToFolder[finding.location.fileId]) {
+      folderKey = fileToFolder[finding.location.fileId];
+    }
+    if (!folderKey) {
+      const locationValue = finding.location.url || finding.location.endpoint || targetUrl;
+      folderKey = resolveFolderForUrl(locationValue, nodes, targetUrl);
+    }
+    if (folderKey && nodes[folderKey]) {
+      addFindingToNodeChain(folderKey, finding);
+    }
+  }
+
+  return { nodes, orderedKeys, fileToFolder };
+}
+
+interface FolderDescriptor {
+  key: string;
+  label: string;
+  depth: number;
+  parentKey: string | null;
+}
+
+function folderChainForUrl(value: string, baseUrl?: string): FolderDescriptor[] {
+  if (!value) return [];
+
+  let parsed: URL;
+  try {
+    parsed = baseUrl ? new URL(value, baseUrl) : new URL(value);
+  } catch {
+    return [];
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return [];
+  }
+
+  const rootKey = `${parsed.origin.toLowerCase()}/`;
+  const chain: FolderDescriptor[] = [
+    {
+      key: rootKey,
+      label: parsed.hostname,
+      depth: 0,
+      parentKey: null,
+    },
+  ];
+
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  let parentKey = rootKey;
+  let currentPath = '';
+
+  segments.forEach((segment, index) => {
+    currentPath += `/${segment}`;
+    const key = `${parsed.origin.toLowerCase()}${currentPath}`;
+    chain.push({
+      key,
+      label: safeDecodeSegment(segment),
+      depth: index + 1,
+      parentKey,
+    });
+    parentKey = key;
+  });
+
+  return chain;
+}
+
+function safeDecodeSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }

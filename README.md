@@ -63,9 +63,11 @@ Copy `.env.example` to `.env` and adjust if needed:
 - `DATA_DIR` (default `./data`)
 - `SCAN_MAX_PAGES` (default `50`)
 - `SCAN_MAX_ASSETS` (default `300`)
-- `REQUEST_TIMEOUT_MS` (default `20000`)
+- `REQUEST_TIMEOUT_MS` (default `12000`)
+- `PREVIEW_REQUEST_TIMEOUT_MS` (default `12000`)
 - `CRAWL_TIMEOUT_MS` (default `300000`)
 - `SCAN_TIMEOUT_MS` (default `480000`)
+- `SCAN_PROGRESS_EVENT_INTERVAL_MS` (default `500`)
 - `ALLOW_INSECURE_TLS` (default `true`, allows self-signed targets)
 
 ## API (Core)

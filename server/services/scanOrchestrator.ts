@@ -23,6 +23,7 @@ const DEFAULT_CRAWL: CrawlOptions = {
 };
 
 const TOTAL_SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 480_000);
+const LIVE_CRAWL_EVENT_INTERVAL_MS = Number(process.env.SCAN_PROGRESS_EVENT_INTERVAL_MS || 500);
 
 const DEFAULT_PROFILE: ScanProfile = {
   passive: true,
@@ -169,29 +170,82 @@ export class ScanOrchestrator {
   }
 
   private async runScanPipeline(scanId: string, scan: ScanDocument): Promise<void> {
-    const crawlResult = await crawlTarget(scan.targetUrl, scan.crawl);
+    const rootProtocol = new URL(scan.targetUrl).protocol;
+    const processedPassiveFileIds = new Set<string>();
+    const processedPassiveRequestIds = new Set<string>();
+    let lastLiveEmitMs = 0;
 
-    scan.files = crawlResult.files;
-    scan.requests = crawlResult.requests;
-    scan.errors.push(...crawlResult.errors);
-    scan.stats.pages = crawlResult.pageUrls.length;
-    scan.stats.assets = crawlResult.files.filter((file) => file.kind !== 'html').length;
-    scan.stats.requests = crawlResult.requests.length;
-    await this.store.saveScan(scan);
-    this.emit(scanId, 'scan-updated', this.summary(scan));
+    const analyzePassiveIncremental = (
+      files: ScanDocument['files'],
+      requests: ScanDocument['requests'],
+    ) => {
+      if (!scan.profile.passive) {
+        return;
+      }
 
-    if (scan.profile.passive) {
-      const rootProtocol = new URL(scan.targetUrl).protocol;
-      for (const file of scan.files) {
+      for (const file of files) {
+        const fileKey = file.fileId || file.url;
+        if (processedPassiveFileIds.has(fileKey)) {
+          continue;
+        }
+        processedPassiveFileIds.add(fileKey);
         this.pushFindings(scan, analyzeSecrets(file));
         this.pushFindings(scan, analyzeFilePatterns(file, rootProtocol));
       }
-      for (const request of scan.requests) {
+
+      for (const request of requests) {
+        const requestKey =
+          request.requestId ||
+          `${request.method}:${request.url}:${request.status || ''}:${request.durationMs || ''}`;
+        if (processedPassiveRequestIds.has(requestKey)) {
+          continue;
+        }
+        processedPassiveRequestIds.add(requestKey);
         this.pushFindings(scan, analyzeHeaders(request));
       }
-      await this.store.saveScan(scan);
-      this.emit(scanId, 'scan-updated', this.summary(scan));
+    };
+
+    const applyCrawlSnapshot = (forceEmit: boolean, crawlResult: {
+      files: ScanDocument['files'];
+      requests: ScanDocument['requests'];
+      pageUrls: string[];
+      errors: string[];
+    }) => {
+      scan.files = crawlResult.files;
+      scan.requests = crawlResult.requests;
+      scan.errors = [...crawlResult.errors];
+      scan.stats.pages = crawlResult.pageUrls.length;
+      scan.stats.assets = crawlResult.files.filter((file) => file.kind !== 'html').length;
+      scan.stats.requests = crawlResult.requests.length;
+      analyzePassiveIncremental(scan.files, scan.requests);
+
+      const now = Date.now();
+      if (forceEmit || now - lastLiveEmitMs >= LIVE_CRAWL_EVENT_INTERVAL_MS) {
+        lastLiveEmitMs = now;
+        this.emit(scanId, 'scan-updated', this.summary(scan));
+      }
+    };
+
+    const crawlResult = await crawlTarget(
+      scan.targetUrl,
+      scan.crawl,
+      (snapshot) => applyCrawlSnapshot(false, snapshot),
+    );
+    applyCrawlSnapshot(true, crawlResult);
+
+    if (scan.profile.passive) {
+      // Final full-pass passive analysis after crawl completes to catch any edge-case misses.
+      for (const file of crawlResult.files) {
+        this.pushFindings(scan, analyzeSecrets(file));
+        this.pushFindings(scan, analyzeFilePatterns(file, rootProtocol));
+      }
+      for (const request of crawlResult.requests) {
+        this.pushFindings(scan, analyzeHeaders(request));
+      }
     }
+
+    await this.store.saveScan(scan);
+    this.emit(scanId, 'scan-updated', this.summary(scan));
 
     if (scan.profile.activeDetection) {
       scan.surface = sortSurfaceByRisk(

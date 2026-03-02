@@ -35,6 +35,15 @@ const SECRET_RULES: SecretRule[] = [
     recommendation: 'Revoke token and move credentials to protected environment configuration.',
   },
   {
+    ruleId: 'SECRET_GOOGLE_API_KEY',
+    title: 'Potential Google API Key Exposed (Gemini Compatible)',
+    severity: 'high',
+    confidence: 'high',
+    pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    recommendation:
+      'Rotate the Google API key, restrict it by API + referrer/IP, and keep it out of client bundles.',
+  },
+  {
     ruleId: 'SECRET_PRIVATE_KEY_BLOCK',
     title: 'Private Key Block Detected',
     severity: 'critical',
