@@ -1,0 +1,31 @@
+{
+  "scanId": "scan_501af4a6-27b6-4347-8e9b-fd490f980646",
+  "targetUrl": "http://ibpgcollegepanipat.ac.in/",
+  "startedAt": "2026-03-02T12:41:12.292Z",
+  "status": "failed",
+  "profile": {
+    "passive": true,
+    "activeDetection": true,
+    "manualReview": true
+  },
+  "crawl": {
+    "maxDepth": 2,
+    "maxPages": 50,
+    "maxAssets": 300
+  },
+  "stats": {
+    "pages": 0,
+    "assets": 0,
+    "requests": 0,
+    "findings": 0
+  },
+  "files": [],
+  "requests": [],
+  "findings": [],
+  "surface": [],
+  "diffs": [],
+  "errors": [
+    "Crawl stage exceeded 120000ms"
+  ],
+  "completedAt": "2026-03-02T12:43:12.339Z"
+}

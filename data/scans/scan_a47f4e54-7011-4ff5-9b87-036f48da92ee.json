@@ -1,0 +1,40 @@
+{
+  "scanId": "scan_a47f4e54-7011-4ff5-9b87-036f48da92ee",
+  "targetUrl": "https://test.devxjin.site/",
+  "startedAt": "2026-03-02T12:42:10.937Z",
+  "status": "completed",
+  "profile": {
+    "passive": true,
+    "activeDetection": true,
+    "manualReview": true
+  },
+  "crawl": {
+    "maxDepth": 2,
+    "maxPages": 50,
+    "maxAssets": 300
+  },
+  "stats": {
+    "pages": 1,
+    "assets": 0,
+    "requests": 1,
+    "findings": 0
+  },
+  "files": [],
+  "requests": [
+    {
+      "requestId": "req_7bab5a3b-1ce3-4c55-a28e-3c7fdbd7eee2",
+      "method": "GET",
+      "url": "https://test.devxjin.site/",
+      "type": "fetch",
+      "durationMs": 1185,
+      "error": "fetch failed (self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca)"
+    }
+  ],
+  "findings": [],
+  "surface": [],
+  "diffs": [],
+  "errors": [
+    "Failed to fetch https://test.devxjin.site/: fetch failed (self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca)"
+  ],
+  "completedAt": "2026-03-02T12:42:12.147Z"
+}

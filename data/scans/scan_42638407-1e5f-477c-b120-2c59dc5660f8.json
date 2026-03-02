@@ -1,0 +1,40 @@
+{
+  "scanId": "scan_42638407-1e5f-477c-b120-2c59dc5660f8",
+  "targetUrl": "https://test.devxjin.site/",
+  "startedAt": "2026-03-02T12:04:43.222Z",
+  "status": "completed",
+  "profile": {
+    "passive": true,
+    "activeDetection": true,
+    "manualReview": true
+  },
+  "crawl": {
+    "maxDepth": 2,
+    "maxPages": 50,
+    "maxAssets": 300
+  },
+  "stats": {
+    "pages": 1,
+    "assets": 0,
+    "requests": 1,
+    "findings": 0
+  },
+  "files": [],
+  "requests": [
+    {
+      "requestId": "req_e8c74639-3218-407f-ba57-3293699e20ae",
+      "method": "GET",
+      "url": "https://test.devxjin.site/",
+      "type": "fetch",
+      "durationMs": 476,
+      "error": "fetch failed"
+    }
+  ],
+  "findings": [],
+  "surface": [],
+  "diffs": [],
+  "errors": [
+    "Failed to fetch https://test.devxjin.site/: fetch failed"
+  ],
+  "completedAt": "2026-03-02T12:04:43.703Z"
+}

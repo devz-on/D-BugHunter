@@ -1,0 +1,5 @@
+{
+  "name": "Project Hunter",
+  "description": "A web vulnerability and secret scanner tool with live interactive preview.",
+  "requestFramePermissions": []
+}
