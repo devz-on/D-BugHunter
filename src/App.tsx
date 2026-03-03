@@ -34,6 +34,7 @@ import {
   NetworkEntry,
   PreviewSession,
   ReviewStatus,
+  ScanProfile,
   ScanSummary,
   SurfaceItem,
 } from './types';
@@ -59,6 +60,7 @@ interface FolderModel {
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [url, setUrl] = useState('https://example.com/');
+  const [authCookie, setAuthCookie] = useState('');
   const [previewUrl, setPreviewUrl] = useState('https://example.com/');
   const [previewCurrentUrl, setPreviewCurrentUrl] = useState<string | null>(null);
   const [previewSession, setPreviewSession] = useState<PreviewSession | null>(null);
@@ -66,6 +68,13 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('files');
   const [scanId, setScanId] = useState<string | null>(null);
   const [scanSummary, setScanSummary] = useState<ScanSummary | null>(null);
+  const [scanProfile, setScanProfile] = useState<ScanProfile>({
+    passive: true,
+    activeDetection: true,
+    manualReview: true,
+    sensitiveExposureChecks: true,
+    nmapPortScan: true,
+  });
 
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
@@ -141,10 +150,13 @@ export default function App() {
     return scanSummary.errors[scanSummary.errors.length - 1];
   }, [scanSummary]);
 
-  const previewFrameSrc = useMemo(
-    () => `/api/preview/proxy?target=${encodeURIComponent(previewUrl)}`,
-    [previewUrl],
-  );
+  const previewFrameSrc = useMemo(() => {
+    const base = `/api/preview/proxy?target=${encodeURIComponent(previewUrl)}`;
+    if (!previewSession?.sessionId) {
+      return base;
+    }
+    return `${base}&sessionId=${encodeURIComponent(previewSession.sessionId)}`;
+  }, [previewUrl, previewSession?.sessionId]);
 
   useEffect(() => {
     if (selectedFolderFiles.length === 0) {
@@ -201,6 +213,7 @@ export default function App() {
   }, [previewUrl, scanSummary?.targetUrl]);
 
   async function runScan(target: string) {
+    const normalizedCookie = normalizeCookie(authCookie);
     setErrorMessage(null);
     setIsScanning(true);
     stopPolling();
@@ -218,17 +231,18 @@ export default function App() {
     setSurface([]);
     setDiffs([]);
     setSelectedFolderKey(null);
+    setPreviewSession(null);
     setPreviewUrl(target);
     setPreviewCurrentUrl(target);
 
     try {
-      const scan = await startScan(target);
+      const scan = await startScan(target, scanProfile, normalizedCookie);
       setScanId(scan.scanId);
       setPreviewUrl(scan.targetUrl);
       setPreviewCurrentUrl(scan.targetUrl);
 
       try {
-        setPreviewSession(await createPreviewSession(scan.targetUrl));
+        setPreviewSession(await createPreviewSession(scan.targetUrl, normalizedCookie));
       } catch {
         setPreviewSession(null);
       }
@@ -370,6 +384,13 @@ export default function App() {
     }
   }
 
+  function setScanProfileFlag(flag: keyof ScanProfile, value: boolean) {
+    setScanProfile((prev) => ({
+      ...prev,
+      [flag]: value,
+    }));
+  }
+
   return (
     <div className={`h-screen overflow-hidden flex flex-col ${theme === 'dark' ? 'bg-[#0a0a0a] text-gray-300' : 'bg-gray-50 text-gray-800'} font-sans transition-colors duration-200`}>
       <header className={`h-14 border-b flex items-center px-2 sm:px-4 justify-between shrink-0 ${theme === 'dark' ? 'bg-[#121212] border-[#222]' : 'bg-white border-gray-200'}`}>
@@ -384,6 +405,44 @@ export default function App() {
           <div className={`flex-1 flex items-center h-9 rounded-l-md px-2 sm:px-3 border-y border-l ${theme === 'dark' ? 'bg-[#1a1a1a] border-[#333]' : 'bg-gray-100 border-gray-300'}`}>
             <Globe size={16} className={`hidden sm:block shrink-0 ${theme === 'dark' ? 'text-gray-500' : 'text-gray-400'}`} />
             <input type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/" className="flex-1 bg-transparent border-none outline-none px-2 sm:px-3 text-sm min-w-0" required />
+          </div>
+          <div className={`hidden lg:flex items-center h-9 border-y px-2 ${theme === 'dark' ? 'bg-[#1a1a1a] border-[#333]' : 'bg-gray-100 border-gray-300'}`}>
+            <input
+              type="text"
+              value={authCookie}
+              onChange={(event) => setAuthCookie(event.target.value)}
+              placeholder="Cookie (optional)"
+              className="w-56 bg-transparent border-none outline-none text-xs"
+            />
+          </div>
+          <div className="hidden md:flex items-center gap-2 px-2 text-[11px] text-gray-500 whitespace-nowrap">
+            <label className="flex items-center gap-1 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={scanProfile.activeDetection}
+                onChange={(event) => setScanProfileFlag('activeDetection', event.target.checked)}
+                className="accent-red-500"
+              />
+              Active
+            </label>
+            <label className="flex items-center gap-1 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={scanProfile.sensitiveExposureChecks}
+                onChange={(event) => setScanProfileFlag('sensitiveExposureChecks', event.target.checked)}
+                className="accent-red-500"
+              />
+              .env checks
+            </label>
+            <label className="flex items-center gap-1 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={scanProfile.nmapPortScan}
+                onChange={(event) => setScanProfileFlag('nmapPortScan', event.target.checked)}
+                className="accent-red-500"
+              />
+              Port scan
+            </label>
           </div>
           <button type="submit" disabled={isScanning} className={`h-9 px-3 sm:px-4 rounded-r-md flex items-center gap-1 sm:gap-2 text-sm font-medium transition-colors shrink-0 ${isScanning ? 'bg-red-500/50 cursor-not-allowed text-white' : 'bg-red-500 hover:bg-red-600 text-white'}`}>
             {isScanning ? <RefreshCw size={16} className="animate-spin" /> : <Play size={16} />}
@@ -646,35 +705,83 @@ function FindingsTab({
   findings: Finding[];
   onReviewChange: (findingId: string, status: ReviewStatus) => void;
 }) {
+  const groupedFindings = useMemo(() => groupFindings(findings), [findings]);
+
   return (
     <div className="h-full min-h-0 overflow-y-auto p-4 space-y-3">
-      {findings.length === 0 ? (
+      {groupedFindings.length === 0 ? (
         <div className="text-sm text-gray-500">No findings yet.</div>
       ) : (
-        findings.map((finding) => (
-          <div key={finding.id} className={`p-4 rounded-lg border ${theme === 'dark' ? 'bg-[#121212] border-[#333]' : 'bg-white border-gray-200 shadow-sm'}`}>
+        groupedFindings.map((group) => {
+          const uniqueStatuses = Array.from(
+            new Set<ReviewStatus>(group.findings.map((finding) => finding.reviewStatus)),
+          );
+          const reviewValue: ReviewStatus | 'mixed' =
+            uniqueStatuses.length === 1 ? uniqueStatuses[0] : 'mixed';
+
+          return (
+          <div key={group.key} className={`p-4 rounded-lg border ${theme === 'dark' ? 'bg-[#121212] border-[#333]' : 'bg-white border-gray-200 shadow-sm'}`}>
             <div className="flex items-start justify-between gap-2 mb-2">
               <div className="flex items-center gap-2">
-                <span className={`px-2 py-0.5 rounded text-xs font-bold uppercase ${severityClass(finding.severity)}`}>{finding.severity}</span>
-                <h3 className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{finding.title}</h3>
+                <span className={`px-2 py-0.5 rounded text-xs font-bold uppercase ${severityClass(group.severity)}`}>{group.severity}</span>
+                <h3 className={`font-semibold ${theme === 'dark' ? 'text-white' : 'text-gray-900'}`}>{group.title}</h3>
               </div>
-              <span className="text-xs text-gray-500 font-mono">{finding.ruleId}</span>
+              <div className="text-right">
+                <div className="text-xs text-gray-500 font-mono">{group.ruleId}</div>
+                <div className="text-[10px] mt-0.5 font-semibold text-red-500">{group.priorityLabel}</div>
+                <div className="text-[10px] text-gray-500 uppercase mt-0.5">{group.findings.length} instance{group.findings.length === 1 ? '' : 's'}</div>
+              </div>
             </div>
-            <div className="text-xs text-gray-500 mb-2">Confidence: {finding.confidence}</div>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{finding.description}</p>
-            <div className="text-xs text-gray-500 mb-2 font-mono bg-black/5 dark:bg-white/5 inline-block px-2 py-1 rounded">
-              {finding.location.endpoint || finding.location.url || 'unknown location'}
-              {finding.location.line ? `:${finding.location.line}` : ''}
+            <div className="text-xs text-gray-500 mb-2">Confidence: {group.confidence}</div>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{group.descriptions[0]}</p>
+            {group.descriptions.length > 1 ? (
+              <div className="text-[11px] text-gray-500 mb-2">
+                Details vary slightly across instances ({group.descriptions.length} variants).
+              </div>
+            ) : null}
+
+            <div className="text-xs text-gray-500 mb-1">Affected pages/endpoints:</div>
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              {group.locations.map((location) =>
+                location.href ? (
+                  <a
+                    key={location.label}
+                    href={location.href}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-xs font-mono bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 px-2 py-1 rounded text-blue-500"
+                    title={location.href}
+                  >
+                    {location.label}
+                  </a>
+                ) : (
+                  <span
+                    key={location.label}
+                    className="text-xs font-mono bg-black/5 dark:bg-white/5 px-2 py-1 rounded text-gray-500"
+                    title={location.label}
+                  >
+                    {location.label}
+                  </span>
+                ),
+              )}
             </div>
-            <div className="text-xs text-gray-500 mb-3">Evidence: {finding.evidence}</div>
-            <div className="text-xs text-gray-500 mb-3">Recommendation: {finding.recommendation}</div>
+
+            <div className="text-xs text-gray-500 mb-3">
+              Evidence: {group.evidences.slice(0, 3).join(' | ')}
+            </div>
+            <div className="text-xs text-gray-500 mb-3">Recommendation: {group.recommendations[0]}</div>
             <div className="flex items-center gap-2">
               <label className="text-xs text-gray-500">Review:</label>
               <select
-                value={finding.reviewStatus}
-                onChange={(event) => onReviewChange(finding.id, event.target.value as ReviewStatus)}
+                value={reviewValue}
+                onChange={(event) => {
+                  const status = event.target.value as ReviewStatus | 'mixed';
+                  if (status === 'mixed') return;
+                  group.findings.forEach((finding) => onReviewChange(finding.id, status));
+                }}
                 className="bg-transparent border border-gray-400/40 rounded px-2 py-1 text-xs"
               >
+                {reviewValue === 'mixed' ? <option value="mixed">mixed</option> : null}
                 <option value="open">open</option>
                 <option value="confirmed">confirmed</option>
                 <option value="false_positive">false_positive</option>
@@ -682,7 +789,8 @@ function FindingsTab({
               </select>
             </div>
           </div>
-        ))
+          );
+        })
       )}
     </div>
   );
@@ -823,6 +931,154 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+interface GroupedFinding {
+  key: string;
+  ruleId: string;
+  title: string;
+  severity: Finding['severity'];
+  confidence: Finding['confidence'];
+  priorityScore: number;
+  priorityLabel: 'P1' | 'P2' | 'P3' | 'P4';
+  findings: Finding[];
+  descriptions: string[];
+  recommendations: string[];
+  evidences: string[];
+  locations: Array<{ label: string; href: string | null }>;
+}
+
+function groupFindings(findings: Finding[]): GroupedFinding[] {
+  const byKey = new Map<string, GroupedFinding>();
+
+  for (const finding of findings) {
+    const key = `${finding.type}:${finding.ruleId || finding.title}`;
+    const locationLabel = findingLocationLabel(finding);
+    const locationHref = findingLocationHref(finding);
+
+    let group = byKey.get(key);
+    if (!group) {
+      group = {
+        key,
+        ruleId: finding.ruleId,
+        title: finding.title,
+        severity: finding.severity,
+        confidence: finding.confidence,
+        priorityScore: 0,
+        priorityLabel: 'P4',
+        findings: [],
+        descriptions: [],
+        recommendations: [],
+        evidences: [],
+        locations: [],
+      };
+      byKey.set(key, group);
+    }
+
+    group.findings.push(finding);
+    if (!group.descriptions.includes(finding.description)) {
+      group.descriptions.push(finding.description);
+    }
+    if (!group.recommendations.includes(finding.recommendation)) {
+      group.recommendations.push(finding.recommendation);
+    }
+    if (!group.evidences.includes(finding.evidence)) {
+      group.evidences.push(finding.evidence);
+    }
+    if (!group.locations.some((location) => location.label === locationLabel)) {
+      group.locations.push({ label: locationLabel, href: locationHref });
+    }
+
+    if (severityScore(finding.severity) > severityScore(group.severity)) {
+      group.severity = finding.severity;
+    }
+    if (confidenceScore(finding.confidence) > confidenceScore(group.confidence)) {
+      group.confidence = finding.confidence;
+    }
+  }
+
+  const groups = Array.from(byKey.values());
+  for (const group of groups) {
+    group.priorityScore = groupPriorityScore(group);
+    group.priorityLabel = priorityLabelFromScore(group.priorityScore);
+  }
+
+  return groups.sort((left, right) => {
+    const priorityDelta = right.priorityScore - left.priorityScore;
+    if (priorityDelta !== 0) return priorityDelta;
+
+    const severityDelta = severityScore(right.severity) - severityScore(left.severity);
+    if (severityDelta !== 0) return severityDelta;
+
+    const countDelta = right.findings.length - left.findings.length;
+    if (countDelta !== 0) return countDelta;
+
+    return left.title.localeCompare(right.title);
+  });
+}
+
+function findingLocationLabel(finding: Finding): string {
+  const base = finding.location.endpoint || finding.location.url || 'unknown location';
+  return finding.location.line ? `${base}:${finding.location.line}` : base;
+}
+
+function findingLocationHref(finding: Finding): string | null {
+  const target = finding.location.url || finding.location.endpoint;
+  if (!target) return null;
+  try {
+    const parsed = new URL(target);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function confidenceScore(confidence: Finding['confidence']): number {
+  if (confidence === 'high') return 3;
+  if (confidence === 'medium') return 2;
+  return 1;
+}
+
+function reviewStatusScore(status: ReviewStatus): number {
+  if (status === 'open') return 4;
+  if (status === 'needs_review') return 3;
+  if (status === 'confirmed') return 2;
+  return 1;
+}
+
+function severityScore(severity: Finding['severity']): number {
+  if (severity === 'critical') return 4;
+  if (severity === 'high') return 3;
+  if (severity === 'medium') return 2;
+  return 1;
+}
+
+function groupPriorityScore(group: GroupedFinding): number {
+  const highestStatusScore = Math.max(
+    ...group.findings.map((finding) => reviewStatusScore(finding.reviewStatus)),
+  );
+  const occurrenceBoost = Math.min(group.findings.length, 20);
+  return (
+    severityScore(group.severity) * 100 +
+    confidenceScore(group.confidence) * 10 +
+    highestStatusScore * 3 +
+    occurrenceBoost
+  );
+}
+
+function priorityLabelFromScore(score: number): 'P1' | 'P2' | 'P3' | 'P4' {
+  if (score >= 380) return 'P1';
+  if (score >= 280) return 'P2';
+  if (score >= 180) return 'P3';
+  return 'P4';
+}
+
+function normalizeCookie(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 function normalizeComparableUrl(value: string, baseUrl?: string): string | null {

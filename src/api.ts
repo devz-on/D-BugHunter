@@ -6,6 +6,7 @@ import {
   NetworkEntry,
   PreviewSession,
   ReviewStatus,
+  ScanProfile,
   ScanSummary,
   SurfaceItem,
 } from './types';
@@ -16,7 +17,25 @@ interface StartScanResponse {
   targetUrl: string;
 }
 
-export async function startScan(targetUrl: string): Promise<StartScanResponse> {
+const DEFAULT_SCAN_PROFILE: ScanProfile = {
+  passive: true,
+  activeDetection: true,
+  manualReview: true,
+  sensitiveExposureChecks: true,
+  nmapPortScan: true,
+};
+
+export async function startScan(
+  targetUrl: string,
+  profileOverrides?: Partial<ScanProfile>,
+  cookie?: string,
+): Promise<StartScanResponse> {
+  const profile = {
+    ...DEFAULT_SCAN_PROFILE,
+    ...(profileOverrides || {}),
+  };
+  const normalizedCookie = normalizeCookie(cookie);
+
   return request('/api/scans', {
     method: 'POST',
     body: JSON.stringify({
@@ -26,19 +45,20 @@ export async function startScan(targetUrl: string): Promise<StartScanResponse> {
         maxPages: 50,
         maxAssets: 300,
       },
-      profile: {
-        passive: true,
-        activeDetection: true,
-        manualReview: true,
-      },
+      profile,
+      auth: normalizedCookie ? { cookie: normalizedCookie } : undefined,
     }),
   });
 }
 
-export async function createPreviewSession(targetUrl: string): Promise<PreviewSession> {
+export async function createPreviewSession(targetUrl: string, cookie?: string): Promise<PreviewSession> {
+  const normalizedCookie = normalizeCookie(cookie);
   return request('/api/preview/sessions', {
     method: 'POST',
-    body: JSON.stringify({ targetUrl }),
+    body: JSON.stringify({
+      targetUrl,
+      ...(normalizedCookie ? { cookie: normalizedCookie } : {}),
+    }),
   });
 }
 
@@ -100,4 +120,9 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(`Request failed (${response.status})${details}`);
   }
   return (await response.json()) as T;
+}
+
+function normalizeCookie(value: string | undefined): string | undefined {
+  const trimmed = (value || '').trim();
+  return trimmed || undefined;
 }

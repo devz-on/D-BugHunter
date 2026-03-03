@@ -3,6 +3,7 @@ import express from 'express';
 import path from 'node:path';
 import { JsonScanStore } from './store/jsonStore';
 import { PreviewSessionManager } from './services/previewSessions';
+import { SecurityCheckpoint, detectSecurityCheckpoint } from './services/securityCheckpoint';
 import { ScanOrchestrator } from './services/scanOrchestrator';
 import { ReviewStatus, ScanStartRequest } from './types';
 
@@ -15,6 +16,11 @@ const port = Number(process.env.PORT || 8787);
 const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const previewRequestTimeoutMs = Number(process.env.PREVIEW_REQUEST_TIMEOUT_MS || 12_000);
 const allowInsecureTls = process.env.ALLOW_INSECURE_TLS !== 'false';
+const PREVIEW_COOKIE = process.env.PREVIEW_COOKIE || process.env.SCANNER_COOKIE || '';
+const BROWSER_LIKE_USER_AGENT =
+  process.env.PREVIEW_USER_AGENT ||
+  process.env.SCANNER_USER_AGENT ||
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 
 const store = new JsonScanStore(dataDir);
 const orchestrator = new ScanOrchestrator(store);
@@ -30,6 +36,7 @@ app.get('/api/health', (_req, res) => {
 
 app.get('/api/preview/proxy', async (req, res) => {
   const targetRaw = String(req.query.target || '');
+  const sessionId = String(req.query.sessionId || '');
   if (!targetRaw) {
     res.status(400).send('Missing target query parameter');
     return;
@@ -46,8 +53,24 @@ app.get('/api/preview/proxy', async (req, res) => {
     return;
   }
 
+  if (shouldServeExamplePage(targetUrl)) {
+    res.status(200);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(rewritePreviewHtml(renderExamplePageHtml(targetUrl.toString()), targetUrl.toString()));
+    return;
+  }
+
+  const sessionCookie = resolvePreviewSessionCookie(preview, sessionId, targetUrl);
+  const requestCookie = sessionCookie || PREVIEW_COOKIE;
+
   try {
-    const proxiedResponse = await fetchPreviewResource(targetUrl.toString(), previewRequestTimeoutMs, allowInsecureTls);
+    const proxiedResponse = await fetchPreviewResource(
+      targetUrl.toString(),
+      previewRequestTimeoutMs,
+      allowInsecureTls,
+      requestCookie,
+    );
     const contentType = proxiedResponse.headers.get('content-type') || '';
     const bodyBuffer = Buffer.from(await proxiedResponse.arrayBuffer());
     const finalUrl = proxiedResponse.url || targetUrl.toString();
@@ -57,6 +80,12 @@ app.get('/api/preview/proxy', async (req, res) => {
 
     if (contentType.toLowerCase().includes('text/html')) {
       const html = bodyBuffer.toString('utf8');
+      const checkpoint = detectSecurityCheckpoint(contentType, html);
+      if (checkpoint) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(renderSecurityCheckpointHtml(finalUrl, checkpoint));
+        return;
+      }
       const rewritten = rewritePreviewHtml(html, finalUrl);
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.send(rewritten);
@@ -252,6 +281,7 @@ app.get('/api/scans/:scanId/diffs', async (req, res) => {
 app.post('/api/preview/sessions', (req, res) => {
   try {
     const targetUrl = String(req.body?.targetUrl || '');
+    const cookie = String(req.body?.cookie || '');
     if (!targetUrl) {
       res.status(400).json({ error: 'targetUrl is required' });
       return;
@@ -261,7 +291,7 @@ app.post('/api/preview/sessions', (req, res) => {
       res.status(400).json({ error: 'Only http/https URLs are supported' });
       return;
     }
-    const session = preview.create(parsed.toString());
+    const session = preview.create(parsed.toString(), cookie);
     res.status(201).json(session);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Invalid URL';
@@ -287,18 +317,19 @@ async function fetchPreviewResource(
   url: string,
   timeoutMs: number,
   insecureTlsAllowed: boolean,
+  requestCookie?: string,
 ): Promise<Response> {
   let lastError: unknown = null;
 
   try {
-    return await fetchWithTimeout(url, timeoutMs, false);
+    return await fetchWithTimeout(url, timeoutMs, false, requestCookie);
   } catch (error) {
     lastError = error;
   }
 
   if (insecureTlsAllowed && isTlsCertificateError(lastError)) {
     try {
-      return await fetchWithTimeout(url, timeoutMs, true);
+      return await fetchWithTimeout(url, timeoutMs, true, requestCookie);
     } catch (error) {
       lastError = error;
     }
@@ -307,7 +338,7 @@ async function fetchPreviewResource(
   if (isRetryableNetworkError(lastError)) {
     await wait(200);
     try {
-      return await fetchWithTimeout(url, timeoutMs, false);
+      return await fetchWithTimeout(url, timeoutMs, false, requestCookie);
     } catch (error) {
       lastError = error;
     }
@@ -320,6 +351,7 @@ async function fetchWithTimeout(
   url: string,
   timeoutMs: number,
   insecureTls: boolean,
+  requestCookie?: string,
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -333,11 +365,18 @@ async function fetchWithTimeout(
       method: 'GET',
       redirect: 'follow',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 HunterPreview/1.1',
+        'User-Agent': BROWSER_LIKE_USER_AGENT,
+        ...(requestCookie ? { Cookie: requestCookie } : {}),
         Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,text/css,*/*;q=0.8',
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-User': '?1',
+        'Sec-Fetch-Dest': 'document',
         Connection: 'keep-alive',
       },
       signal: controller.signal,
@@ -661,4 +700,170 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function renderSecurityCheckpointHtml(targetUrl: string, checkpoint: SecurityCheckpoint): string {
+  const escapedUrl = escapeHtml(targetUrl);
+  const escapedSummary = escapeHtml(checkpoint.summary);
+  const codeLabel = checkpoint.code ? `Code ${escapeHtml(checkpoint.code)}` : 'Challenge detected';
+  const reference = checkpoint.referenceId ? escapeHtml(checkpoint.referenceId) : 'not provided';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security Checkpoint Detected</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: #0b1020;
+      color: #e5e7eb;
+    }
+    main {
+      width: min(780px, 92vw);
+      background: #111827;
+      border: 1px solid #374151;
+      border-radius: 14px;
+      padding: 24px;
+      box-shadow: 0 16px 50px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    p {
+      margin: 0 0 12px;
+      line-height: 1.6;
+      color: #d1d5db;
+    }
+    code {
+      display: block;
+      margin: 8px 0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #4b5563;
+      background: #0f172a;
+      color: #cbd5e1;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Security checkpoint blocked preview</h1>
+    <p>${escapedSummary}</p>
+    <code>${codeLabel} | ref: ${reference}</code>
+    <p>Target: <code>${escapedUrl}</code></p>
+    <p>If you are authorized to test this target, open it in a regular browser, complete the challenge, then provide clearance cookie in the UI Cookie field or in local <code>.env</code>:</p>
+    <code>SCANNER_COOKIE=...<br>PREVIEW_COOKIE=...</code>
+  </main>
+</body>
+</html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function resolvePreviewSessionCookie(
+  manager: PreviewSessionManager,
+  sessionId: string,
+  targetUrl: URL,
+): string | undefined {
+  const trimmedSessionId = sessionId.trim();
+  if (!trimmedSessionId) {
+    return undefined;
+  }
+  const session = manager.get(trimmedSessionId);
+  if (!session) {
+    return undefined;
+  }
+
+  try {
+    const sessionTarget = new URL(session.targetUrl);
+    if (sessionTarget.hostname.toLowerCase() !== targetUrl.hostname.toLowerCase()) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return manager.getCookie(trimmedSessionId);
+}
+
+function shouldServeExamplePage(targetUrl: URL): boolean {
+  const host = targetUrl.hostname.toLowerCase();
+  if (host !== 'example.com' && host !== 'www.example.com') {
+    return false;
+  }
+  const pathname = targetUrl.pathname || '/';
+  return pathname === '/' || pathname === '/index.html';
+}
+
+function renderExamplePageHtml(targetUrl: string): string {
+  const escapedTarget = targetUrl.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Example Page</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(160deg, #f1f5f9, #dbeafe);
+      color: #111827;
+    }
+    main {
+      width: min(680px, 92vw);
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid #cbd5e1;
+      border-radius: 14px;
+      padding: 28px;
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.14);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 30px;
+      line-height: 1.2;
+    }
+    p {
+      margin: 0;
+      line-height: 1.6;
+      color: #374151;
+    }
+    code {
+      display: inline-block;
+      margin-top: 10px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 5px 8px;
+      font-size: 13px;
+      color: #0f172a;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>This is an example page.</h1>
+    <p>The preview proxy served this placeholder for example.com so you can test the scanner safely.</p>
+    <code>${escapedTarget}</code>
+  </main>
+</body>
+</html>`;
 }

@@ -18,12 +18,17 @@ export interface ScanProfile {
   passive: boolean;
   activeDetection: boolean;
   manualReview: boolean;
+  sensitiveExposureChecks: boolean;
+  nmapPortScan: boolean;
 }
 
 export interface ScanStartRequest {
   targetUrl: string;
   crawl?: Partial<CrawlOptions>;
   profile?: Partial<ScanProfile>;
+  auth?: {
+    cookie?: string;
+  };
 }
 
 export interface ExtractedFile {

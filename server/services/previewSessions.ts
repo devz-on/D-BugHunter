@@ -10,8 +10,9 @@ export interface PreviewSession {
 
 export class PreviewSessionManager {
   private sessions = new Map<string, PreviewSession>();
+  private sessionCookies = new Map<string, string>();
 
-  create(targetUrl: string): PreviewSession {
+  create(targetUrl: string, cookie?: string): PreviewSession {
     const session: PreviewSession = {
       sessionId: `preview_${randomUUID()}`,
       targetUrl,
@@ -20,6 +21,10 @@ export class PreviewSessionManager {
       note: 'Direct iframe mode is active. Some sites may block embedding via CSP/X-Frame-Options.',
     };
     this.sessions.set(session.sessionId, session);
+    const normalizedCookie = normalizeCookie(cookie);
+    if (normalizedCookie) {
+      this.sessionCookies.set(session.sessionId, normalizedCookie);
+    }
     return session;
   }
 
@@ -27,7 +32,17 @@ export class PreviewSessionManager {
     return this.sessions.get(sessionId) || null;
   }
 
+  getCookie(sessionId: string): string | undefined {
+    return this.sessionCookies.get(sessionId);
+  }
+
   destroy(sessionId: string): boolean {
+    this.sessionCookies.delete(sessionId);
     return this.sessions.delete(sessionId);
   }
+}
+
+function normalizeCookie(value: string | undefined): string | undefined {
+  const trimmed = (value || '').trim();
+  return trimmed || undefined;
 }

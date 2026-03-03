@@ -10,10 +10,14 @@ It crawls same-origin pages/assets, performs passive checks, runs safe active be
 - Extracts HTML/CSS/JS/JSON/text assets
 - Passive findings:
   - leaked secrets/tokens patterns
+  - sensitive file exposure probes (`/.env`, `/.aws/credentials`, `/.svn/entries`, `/backup.sql`, `/.git/config`, etc.)
   - missing security headers
   - cookie flag issues
   - sourcemap/debug artifacts
   - mixed content/risky JS sink heuristics
+- Optional host-level checks:
+  - built-in top-port TCP scan with open-port findings
+  - built-in port vulnerability checks (service/version/auth exposure heuristics)
 - Safe active detection:
   - endpoint/parameter discovery
   - baseline vs benign edge-case input diffs
@@ -69,6 +73,18 @@ Copy `.env.example` to `.env` and adjust if needed:
 - `SCAN_TIMEOUT_MS` (default `480000`)
 - `SCAN_PROGRESS_EVENT_INTERVAL_MS` (default `500`)
 - `ALLOW_INSECURE_TLS` (default `true`, allows self-signed targets)
+- `SCANNER_USER_AGENT` (optional browser-like UA override for crawler requests)
+- `PREVIEW_USER_AGENT` (optional browser-like UA override for preview proxy requests)
+- `SCANNER_COOKIE` (optional, authorized session cookie for scanner fetches)
+- `PREVIEW_COOKIE` (optional, authorized session cookie for preview proxy fetches)
+- `PORT_SCAN_TOP_PORTS` (default `200`)
+- `PORT_SCAN_TIMEOUT_MS` (default `1200`)
+- `PORT_SCAN_CONCURRENCY` (default `24`)
+- `PORT_SCAN_PORTS` (optional comma-separated TCP ports)
+- `PORT_VULN_SCAN_ENABLED` (default `true`)
+- `PORT_VULN_MAX_SERVICES` (default `12`)
+- `PORT_VULN_TIMEOUT_MS` (default `1800`)
+- `PORT_VULN_CONCURRENCY` (default `4`)
 
 ## API (Core)
 
@@ -89,4 +105,9 @@ Copy `.env.example` to `.env` and adjust if needed:
 ## Notes
 
 - The preview pane uses iframe mode, so some sites may block embedding via CSP/X-Frame-Options.
+- Targets with anti-bot checkpoints (for example Vercel Security Checkpoint Code 99) are detected explicitly.
+- For protected targets, you can paste session cookie directly in the UI `Cookie (optional)` field (no restart needed).
+- `https://example.com/` uses a built-in placeholder preview page: "This is an example page."
+- Port scanning is fully built-in and does not require an external `nmap` executable.
+- Re-scanning the same normalized target URL reuses and updates the same JSON report file instead of creating a new file.
 - Scans are constrained by depth and asset/page caps for stability.

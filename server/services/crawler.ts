@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { randomUUID } from 'node:crypto';
+import { buildCheckpointErrorMessage, detectSecurityCheckpoint } from './securityCheckpoint';
 import {
   CrawlOptions,
   CrawlResult,
@@ -13,6 +14,10 @@ interface QueueItem {
   url: string;
   depth: number;
   discoveredFrom?: string;
+}
+
+interface CrawlRequestOptions {
+  cookie?: string;
 }
 
 interface FetchResult {
@@ -31,12 +36,18 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 12_000);
 const CRAWL_TIMEOUT_MS = Number(process.env.CRAWL_TIMEOUT_MS || 300_000);
 const MAX_TEXT_BYTES = 1024 * 1024;
 const ALLOW_INSECURE_TLS = process.env.ALLOW_INSECURE_TLS !== 'false';
+const DEFAULT_SCANNER_COOKIE = process.env.SCANNER_COOKIE || '';
+const BROWSER_LIKE_USER_AGENT =
+  process.env.SCANNER_USER_AGENT ||
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 
 export async function crawlTarget(
   targetUrl: string,
   options: CrawlOptions,
   onProgress?: (snapshot: CrawlResult) => void,
+  requestOptions?: CrawlRequestOptions,
 ): Promise<CrawlResult> {
+  const requestCookie = normalizeCookie(requestOptions?.cookie) || DEFAULT_SCANNER_COOKIE;
   const startedAt = Date.now();
   const origin = new URL(targetUrl).origin;
   const queue: QueueItem[] = [{ url: normalizeUrl(targetUrl), depth: 0 }];
@@ -86,7 +97,7 @@ export async function crawlTarget(
     addQueryParamsFromUrl(current.url, queryParams);
     reportProgress();
 
-    const pageResult = await fetchTextResource(current.url);
+    const pageResult = await fetchTextResource(current.url, requestCookie);
     requests.push(pageResult.record);
     reportProgress();
     if (pageResult.record.error) {
@@ -151,7 +162,7 @@ export async function crawlTarget(
       addQueryParamsFromUrl(normalizedAsset, queryParams);
       reportProgress();
 
-      const assetResult = await fetchTextResource(normalizedAsset);
+      const assetResult = await fetchTextResource(normalizedAsset, requestCookie);
       requests.push(assetResult.record);
       reportProgress();
       if (assetResult.record.error || !assetResult.text) {
@@ -378,20 +389,24 @@ function extractAttr(rawAttrs: string, attrName: string): string | null {
   return match ? match[1] : null;
 }
 
-async function fetchTextResource(url: string): Promise<FetchResult> {
+async function fetchTextResource(url: string, requestCookie?: string): Promise<FetchResult> {
   const requestId = `req_${randomUUID()}`;
   const startedAt = Date.now();
+  const exampleResult = examplePageFetchResult(url, requestId, startedAt);
+  if (exampleResult) {
+    return exampleResult;
+  }
   let lastError: unknown = null;
 
   try {
-    return await requestOnce(url, requestId, startedAt, false);
+    return await requestOnce(url, requestId, startedAt, false, requestCookie);
   } catch (error) {
     lastError = error;
   }
 
   if (ALLOW_INSECURE_TLS && isTlsCertificateError(lastError)) {
     try {
-      return await requestOnce(url, requestId, startedAt, true);
+      return await requestOnce(url, requestId, startedAt, true, requestCookie);
     } catch (error) {
       lastError = error;
     }
@@ -400,7 +415,7 @@ async function fetchTextResource(url: string): Promise<FetchResult> {
   if (isRetryableNetworkError(lastError)) {
     await wait(200);
     try {
-      return await requestOnce(url, requestId, startedAt, false);
+      return await requestOnce(url, requestId, startedAt, false, requestCookie);
     } catch (error) {
       lastError = error;
     }
@@ -430,6 +445,7 @@ async function requestOnce(
   requestId: string,
   startedAt: number,
   insecureTls: boolean,
+  requestCookie?: string,
 ): Promise<FetchResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -443,11 +459,18 @@ async function requestOnce(
       method: 'GET',
       redirect: 'follow',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 HunterScanner/1.1',
+        'User-Agent': BROWSER_LIKE_USER_AGENT,
+        ...(requestCookie ? { Cookie: requestCookie } : {}),
         Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,text/css,*/*;q=0.8',
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-User': '?1',
+        'Sec-Fetch-Dest': 'document',
         Connection: 'keep-alive',
       },
       signal: controller.signal,
@@ -459,20 +482,26 @@ async function requestOnce(
     const size = bytes.byteLength;
     const durationMs = Date.now() - startedAt;
     const text = shouldDecodeText(contentType, bytes) ? bytes.toString('utf8') : '';
+    const checkpoint = detectSecurityCheckpoint(contentType, text);
+
+    const record: NetworkRequestRecord = {
+      requestId,
+      method: 'GET',
+      url,
+      status: response.status,
+      type: inferRequestType(contentType),
+      size,
+      contentType,
+      durationMs,
+      responseHeaders: Object.fromEntries(response.headers.entries()),
+    };
+    if (checkpoint) {
+      record.error = buildCheckpointErrorMessage(checkpoint, response.url || url);
+    }
 
     return {
-      record: {
-        requestId,
-        method: 'GET',
-        url,
-        status: response.status,
-        type: inferRequestType(contentType),
-        size,
-        contentType,
-        durationMs,
-        responseHeaders: Object.fromEntries(response.headers.entries()),
-      },
-      text,
+      record,
+      text: checkpoint ? '' : text,
       contentType,
     };
   } finally {
@@ -578,10 +607,59 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
+function normalizeCookie(value: string | undefined): string | undefined {
+  const trimmed = (value || '').trim();
+  return trimmed || undefined;
+}
+
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function examplePageFetchResult(url: string, requestId: string, startedAt: number): FetchResult | null {
+  if (!shouldServeExamplePage(url)) {
+    return null;
+  }
+
+  const html = renderExamplePageHtml(url);
+  return {
+    record: {
+      requestId,
+      method: 'GET',
+      url,
+      status: 200,
+      type: 'document',
+      size: Buffer.byteLength(html, 'utf8'),
+      contentType: 'text/html; charset=utf-8',
+      durationMs: Date.now() - startedAt,
+      responseHeaders: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+      },
+    },
+    text: html,
+    contentType: 'text/html; charset=utf-8',
+  };
+}
+
+function shouldServeExamplePage(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host !== 'example.com' && host !== 'www.example.com') {
+      return false;
+    }
+    const pathname = parsed.pathname || '/';
+    return pathname === '/' || pathname === '/index.html';
+  } catch {
+    return false;
+  }
+}
+
+function renderExamplePageHtml(url: string): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Example Page</title></head><body><h1>This is an example page.</h1><p>Generated locally for scanner preview and crawl testing.</p><p>${url}</p></body></html>`;
 }
 
 export function createHash(value: string): string {

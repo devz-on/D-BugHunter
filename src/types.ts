@@ -4,6 +4,14 @@ export type Severity = 'low' | 'medium' | 'high' | 'critical';
 export type Confidence = 'low' | 'medium' | 'high';
 export type ReviewStatus = 'open' | 'confirmed' | 'false_positive' | 'needs_review';
 
+export interface ScanProfile {
+  passive: boolean;
+  activeDetection: boolean;
+  manualReview: boolean;
+  sensitiveExposureChecks: boolean;
+  nmapPortScan: boolean;
+}
+
 export interface ScanSummary {
   scanId: string;
   targetUrl: string;

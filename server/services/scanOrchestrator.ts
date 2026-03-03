@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { Response } from 'express';
 import { runActiveDetection, buildSurface } from './analyzers/activeDetection';
+import { probeSensitivePaths } from './analyzers/exposureProbe';
+import { runNmapPortScan } from './analyzers/nmap';
 import { analyzeFilePatterns, analyzeHeaders } from './analyzers/security';
 import { analyzeSecrets } from './analyzers/secrets';
 import { crawlTarget } from './crawler';
@@ -29,17 +31,31 @@ const DEFAULT_PROFILE: ScanProfile = {
   passive: true,
   activeDetection: true,
   manualReview: true,
+  sensitiveExposureChecks: true,
+  nmapPortScan: true,
 };
 
 export class ScanOrchestrator {
   private scans = new Map<string, ScanDocument>();
   private eventClients = new Map<string, Set<Response>>();
+  private scanAuth = new Map<string, { cookie?: string }>();
 
   constructor(private readonly store: JsonScanStore) {}
 
   async startScan(input: ScanStartRequest): Promise<ScanDocument> {
     const targetUrl = normalizeTargetUrl(input.targetUrl);
-    const scanId = `scan_${randomUUID()}`;
+    const existing = await this.findLatestScanForTarget(targetUrl);
+    if (existing && (existing.status === 'queued' || existing.status === 'running')) {
+      this.scans.set(existing.scanId, existing);
+      if (input.auth?.cookie) {
+        this.scanAuth.set(existing.scanId, {
+          cookie: normalizeCookie(input.auth.cookie),
+        });
+      }
+      return existing;
+    }
+
+    const scanId = existing?.scanId || `scan_${randomUUID()}`;
     const crawl = {
       ...DEFAULT_CRAWL,
       ...(input.crawl || {}),
@@ -71,6 +87,9 @@ export class ScanOrchestrator {
     };
 
     this.scans.set(scanId, scan);
+    this.scanAuth.set(scanId, {
+      cookie: normalizeCookie(input.auth?.cookie),
+    });
     await this.store.saveScan(scan);
     this.emit(scanId, 'scan-updated', this.summary(scan));
 
@@ -166,13 +185,18 @@ export class ScanOrchestrator {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Scan execution failed';
       await this.failScan(scanId, message);
+    } finally {
+      this.scanAuth.delete(scanId);
     }
   }
 
   private async runScanPipeline(scanId: string, scan: ScanDocument): Promise<void> {
+    const auth = this.scanAuth.get(scanId);
     const rootProtocol = new URL(scan.targetUrl).protocol;
     const processedPassiveFileIds = new Set<string>();
     const processedPassiveRequestIds = new Set<string>();
+    const fileUrlIndex = new Set<string>();
+    const requestIndex = new Set<string>();
     let lastLiveEmitMs = 0;
 
     const analyzePassiveIncremental = (
@@ -219,6 +243,15 @@ export class ScanOrchestrator {
       scan.stats.requests = crawlResult.requests.length;
       analyzePassiveIncremental(scan.files, scan.requests);
 
+      fileUrlIndex.clear();
+      for (const file of scan.files) {
+        fileUrlIndex.add(file.url);
+      }
+      requestIndex.clear();
+      for (const request of scan.requests) {
+        requestIndex.add(requestSignature(request));
+      }
+
       const now = Date.now();
       if (forceEmit || now - lastLiveEmitMs >= LIVE_CRAWL_EVENT_INTERVAL_MS) {
         lastLiveEmitMs = now;
@@ -230,6 +263,7 @@ export class ScanOrchestrator {
       scan.targetUrl,
       scan.crawl,
       (snapshot) => applyCrawlSnapshot(false, snapshot),
+      { cookie: auth?.cookie },
     );
     applyCrawlSnapshot(true, crawlResult);
 
@@ -242,6 +276,47 @@ export class ScanOrchestrator {
       for (const request of crawlResult.requests) {
         this.pushFindings(scan, analyzeHeaders(request));
       }
+    }
+
+    if (scan.profile.sensitiveExposureChecks) {
+      const probeResult = await probeSensitivePaths(scan.targetUrl, { cookie: auth?.cookie });
+      if (probeResult.errors.length > 0) {
+        scan.errors.push(...probeResult.errors);
+      }
+
+      const newlyAddedFiles: ScanDocument['files'] = [];
+      for (const file of probeResult.files) {
+        if (fileUrlIndex.has(file.url)) {
+          continue;
+        }
+        fileUrlIndex.add(file.url);
+        scan.files.push(file);
+        newlyAddedFiles.push(file);
+      }
+
+      const newlyAddedRequests: ScanDocument['requests'] = [];
+      for (const request of probeResult.requests) {
+        const signature = requestSignature(request);
+        if (requestIndex.has(signature)) {
+          continue;
+        }
+        requestIndex.add(signature);
+        scan.requests.push(request);
+        newlyAddedRequests.push(request);
+      }
+
+      analyzePassiveIncremental(newlyAddedFiles, newlyAddedRequests);
+      this.pushFindings(scan, probeResult.findings);
+      scan.stats.assets = scan.files.filter((file) => file.kind !== 'html').length;
+      scan.stats.requests = scan.requests.length;
+    }
+
+    if (scan.profile.nmapPortScan) {
+      const nmapResult = await runNmapPortScan(scan.targetUrl);
+      if (nmapResult.errors.length > 0) {
+        scan.errors.push(...nmapResult.errors);
+      }
+      this.pushFindings(scan, nmapResult.findings);
     }
 
     await this.store.saveScan(scan);
@@ -289,6 +364,39 @@ export class ScanOrchestrator {
     scan.completedAt = new Date().toISOString();
     await this.store.saveScan(scan);
     this.emit(scanId, 'scan-failed', this.summary(scan));
+  }
+
+  private async findLatestScanForTarget(targetUrl: string): Promise<ScanDocument | null> {
+    const candidates: ScanDocument[] = [];
+
+    for (const scan of this.scans.values()) {
+      if (isSameTargetUrl(scan.targetUrl, targetUrl)) {
+        candidates.push(scan);
+      }
+    }
+
+    const persisted = await this.store.listScans();
+    for (const scan of persisted) {
+      if (!this.scans.has(scan.scanId)) {
+        this.scans.set(scan.scanId, scan);
+      }
+      if (isSameTargetUrl(scan.targetUrl, targetUrl)) {
+        candidates.push(scan);
+      }
+    }
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    candidates.sort((left, right) => {
+      const leftStarted = Date.parse(left.startedAt) || 0;
+      const rightStarted = Date.parse(right.startedAt) || 0;
+      return rightStarted - leftStarted;
+    });
+    const latest = candidates[0];
+    await this.recoverStaleScan(latest);
+    return latest;
   }
 
   private getScanSync(scanId: string): ScanDocument | null {
@@ -365,6 +473,23 @@ function normalizeTargetUrl(rawUrl: string): string {
   }
   parsed.hash = '';
   return parsed.toString();
+}
+
+function normalizeCookie(value: string | undefined): string | undefined {
+  const trimmed = (value || '').trim();
+  return trimmed || undefined;
+}
+
+function isSameTargetUrl(left: string, right: string): boolean {
+  try {
+    return normalizeTargetUrl(left) === normalizeTargetUrl(right);
+  } catch {
+    return left === right;
+  }
+}
+
+function requestSignature(request: ScanDocument['requests'][number]): string {
+  return `${request.method}:${request.url}:${request.status || ''}:${request.type || ''}:${request.error || ''}`;
 }
 
 function sendEvent(response: Response, event: string, payload: unknown): void {
